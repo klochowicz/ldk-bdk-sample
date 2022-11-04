@@ -1,23 +1,32 @@
 use crate::disk;
 use crate::hex_utils;
 use crate::LightningWallet;
+use crate::NetGraph;
+use crate::OnionMessenger;
 use crate::{
     ChannelManager, FilesystemLogger, HTLCStatus, InvoicePayer, MillisatAmount, PaymentInfo,
     PaymentInfoStorage, PeerManager,
 };
-
+use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::network::constants::Network;
-use bitcoin::secp256k1::key::PublicKey;
+use bitcoin::secp256k1::PublicKey;
+use lightning::chain::keysinterface::Recipient;
 use lightning::chain::keysinterface::{KeysInterface, KeysManager};
+use lightning::ln::msgs::DecodeError;
 use lightning::ln::msgs::NetAddress;
 use lightning::ln::PaymentHash;
-use lightning::routing::network_graph::NetworkGraph;
-use lightning::routing::router;
-use lightning::routing::router::{Payee, RouteParameters};
-use lightning::routing::scoring::Scorer;
-use lightning::util::config::{ChannelConfig, ChannelHandshakeLimits, UserConfig};
+use lightning::ln::PaymentPreimage;
+use lightning::onion_message::CustomOnionMessageContents;
+use lightning::onion_message::Destination;
+use lightning::onion_message::OnionMessageContents;
+use lightning::routing::gossip::NodeId;
+use lightning::util::config::ChannelHandshakeConfig;
+use lightning::util::config::{ChannelHandshakeLimits, UserConfig};
 use lightning::util::events::EventHandler;
+use lightning::util::ser::MaybeReadableArgs;
+use lightning::util::ser::Writeable;
+use lightning::util::ser::Writer;
 use lightning_invoice::payment::PaymentError;
 use lightning_invoice::{utils, Currency, Invoice};
 use std::env;
@@ -27,7 +36,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::ops::Deref;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(crate) struct LdkUserInfo {
@@ -127,8 +136,8 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
     peer_manager: Arc<PeerManager>,
     channel_manager: Arc<ChannelManager>,
     keys_manager: Arc<KeysManager>,
-    network_graph: Arc<NetworkGraph>,
-    scorer: Arc<Mutex<Scorer>>,
+    network_graph: Arc<NetGraph>,
+    onion_messenger: Arc<OnionMessenger>,
     inbound_payments: PaymentInfoStorage,
     outbound_payments: PaymentInfoStorage,
     ldk_data_dir: String,
@@ -247,15 +256,11 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
                             Some(pk) => pk,
                             None => {
                                 println!("ERROR: couldn't parse destination pubkey");
-                                print!("> ");
-                                io::stdout().flush().unwrap();
                                 continue;
                             }
                         },
                         None => {
                             println!("ERROR: keysend requires a destination pubkey: `keysend <dest_pubkey> <amt_msat>`");
-                            print!("> ");
-                            io::stdout().flush().unwrap();
                             continue;
                         }
                     };
@@ -263,9 +268,6 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
                         Some(amt) => amt,
                         None => {
                             println!("ERROR: keysend requires an amount in millisatoshis: `keysend <dest_pubkey> <amt_msat>`");
-
-                            print!("> ");
-                            io::stdout().flush().unwrap();
                             continue;
                         }
                     };
@@ -273,19 +275,15 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
                         Ok(amt) => amt,
                         Err(e) => {
                             println!("ERROR: couldn't parse amount_msat: {}", e);
-                            print!("> ");
-                            io::stdout().flush().unwrap();
                             continue;
                         }
                     };
                     keysend(
+                        &*invoice_payer,
                         dest_pubkey,
                         amt_msat,
-                        network_graph.clone(),
-                        channel_manager.clone(),
+                        &*keys_manager,
                         outbound_payments.clone(),
-                        logger.clone(),
-                        scorer.clone(),
                     );
                 }
                 "getinvoice" => {
@@ -304,12 +302,26 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
                         io::stdout().flush().unwrap();
                         continue;
                     }
+
+                    let expiry_secs_str = words.next();
+                    if expiry_secs_str.is_none() {
+                        println!("ERROR: getinvoice requires an expiry in seconds");
+                        continue;
+                    }
+
+                    let expiry_secs: Result<u32, _> = expiry_secs_str.unwrap().parse();
+                    if expiry_secs.is_err() {
+                        println!("ERROR: getinvoice provided expiry was not a number");
+                        continue;
+                    }
                     get_invoice(
                         amt_msat.unwrap(),
                         inbound_payments.clone(),
                         channel_manager.clone(),
                         keys_manager.clone(),
                         network,
+                        expiry_secs.unwrap(),
+                        Arc::clone(&logger),
                     );
                 }
                 "connectpeer" => {
@@ -337,7 +349,7 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
                         println!("SUCCESS: connected to peer {}", pubkey);
                     }
                 }
-                "listchannels" => list_channels(channel_manager.clone()),
+                "listchannels" => list_channels(&channel_manager, &network_graph),
                 "listpayments" => {
                     list_payments(inbound_payments.clone(), outbound_payments.clone())
                 }
@@ -358,7 +370,28 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
                     }
                     let mut channel_id = [0; 32];
                     channel_id.copy_from_slice(&channel_id_vec.unwrap());
-                    close_channel(channel_id, channel_manager.clone());
+
+                    let peer_pubkey_str = words.next();
+                    if peer_pubkey_str.is_none() {
+                        println!("ERROR: closechannel requires a peer pubkey: `closechannel <channel_id> <peer_pubkey>`");
+                        continue;
+                    }
+                    let peer_pubkey_vec = match hex_utils::to_vec(peer_pubkey_str.unwrap()) {
+                        Some(peer_pubkey_vec) => peer_pubkey_vec,
+                        None => {
+                            println!("ERROR: couldn't parse peer_pubkey");
+                            continue;
+                        }
+                    };
+                    let peer_pubkey = match PublicKey::from_slice(&peer_pubkey_vec) {
+                        Ok(peer_pubkey) => peer_pubkey,
+                        Err(_) => {
+                            println!("ERROR: couldn't parse peer_pubkey");
+                            continue;
+                        }
+                    };
+
+                    close_channel(channel_id, peer_pubkey, channel_manager.clone());
                 }
                 "forceclosechannel" => {
                     let channel_id_str = words.next();
@@ -377,7 +410,27 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
                     }
                     let mut channel_id = [0; 32];
                     channel_id.copy_from_slice(&channel_id_vec.unwrap());
-                    force_close_channel(channel_id, channel_manager.clone());
+
+                    let peer_pubkey_str = words.next();
+                    if peer_pubkey_str.is_none() {
+                        println!("ERROR: forceclosechannel requires a peer pubkey: `forceclosechannel <channel_id> <peer_pubkey>`");
+                        continue;
+                    }
+                    let peer_pubkey_vec = match hex_utils::to_vec(peer_pubkey_str.unwrap()) {
+                        Some(peer_pubkey_vec) => peer_pubkey_vec,
+                        None => {
+                            println!("ERROR: couldn't parse peer_pubkey");
+                            continue;
+                        }
+                    };
+                    let peer_pubkey = match PublicKey::from_slice(&peer_pubkey_vec) {
+                        Ok(peer_pubkey) => peer_pubkey,
+                        Err(_) => {
+                            println!("ERROR: couldn't parse peer_pubkey");
+                            continue;
+                        }
+                    };
+                    force_close_channel(channel_id, peer_pubkey, channel_manager.clone());
                 }
                 "nodeinfo" => node_info(channel_manager.clone(), peer_manager.clone()),
                 "listpeers" => list_peers(peer_manager.clone()),
@@ -393,12 +446,70 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
                         "{:?}",
                         lightning::util::message_signing::sign(
                             &line.as_bytes()[MSG_STARTPOS..],
-                            &keys_manager.get_node_secret()
+                            &keys_manager.get_node_secret(Recipient::Node).unwrap()
                         )
                     );
                     print!("> ");
                     io::stdout().flush().unwrap();
                 }
+                "sendonionmessage" => {
+                    let path_pks_str = words.next();
+                    if path_pks_str.is_none() {
+                        println!(
+                            "ERROR: sendonionmessage requires at least one node id for the path"
+                        );
+                        continue;
+                    }
+                    let mut node_pks = Vec::new();
+                    let mut errored = false;
+                    for pk_str in path_pks_str.unwrap().split(",") {
+                        let node_pubkey_vec = match hex_utils::to_vec(pk_str) {
+                            Some(peer_pubkey_vec) => peer_pubkey_vec,
+                            None => {
+                                println!("ERROR: couldn't parse peer_pubkey");
+                                errored = true;
+                                break;
+                            }
+                        };
+                        let node_pubkey = match PublicKey::from_slice(&node_pubkey_vec) {
+                            Ok(peer_pubkey) => peer_pubkey,
+                            Err(_) => {
+                                println!("ERROR: couldn't parse peer_pubkey");
+                                errored = true;
+                                break;
+                            }
+                        };
+                        node_pks.push(node_pubkey);
+                    }
+                    if errored {
+                        continue;
+                    }
+                    let tlv_type = match words.next().map(|ty_str| ty_str.parse()) {
+                        Some(Ok(ty)) if ty >= 64 => ty,
+                        _ => {
+                            println!("Need an integral message type above 64");
+                            continue;
+                        }
+                    };
+                    let data = match words.next().map(|s| hex_utils::to_vec(s)) {
+                        Some(Some(data)) => data,
+                        _ => {
+                            println!("Need a hex data string");
+                            continue;
+                        }
+                    };
+                    let destination_pk = node_pks.pop().unwrap();
+                    match onion_messenger.send_onion_message(
+                        &node_pks,
+                        Destination::Node(destination_pk),
+                        OnionMessageContents::Custom(UserOnionMessageContents { tlv_type, data }),
+                        None,
+                    ) {
+                        Ok(()) => println!("SUCCESS: forwarded onion message to first hop"),
+                        Err(e) => println!("ERROR: failed to send onion message: {:?}", e),
+                    }
+                }
+                "quit" | "exit" => break,
                 _ => println!("Unknown command. See `\"help\" for available commands."),
             }
         }
@@ -446,10 +557,10 @@ fn list_peers(peer_manager: Arc<PeerManager>) {
     println!("\t}},");
 }
 
-fn list_channels(channel_manager: Arc<ChannelManager>) {
+fn list_channels(channel_manager: &Arc<ChannelManager>, network_graph: &Arc<NetGraph>) {
     print!("[");
     for chan_info in channel_manager.list_channels() {
-        println!();
+        println!("");
         println!("\t{{");
         println!(
             "\t\tchannel_id: {},",
@@ -458,23 +569,30 @@ fn list_channels(channel_manager: Arc<ChannelManager>) {
         if let Some(funding_txo) = chan_info.funding_txo {
             println!("\t\tfunding_txid: {},", funding_txo.txid);
         }
+
         println!(
             "\t\tpeer_pubkey: {},",
             hex_utils::hex_str(&chan_info.counterparty.node_id.serialize())
         );
+        if let Some(node_info) = network_graph
+            .read_only()
+            .nodes()
+            .get(&NodeId::from_pubkey(&chan_info.counterparty.node_id))
+        {
+            if let Some(announcement) = &node_info.announcement_info {
+                println!("\t\tpeer_alias: {}", announcement.alias);
+            }
+        }
+
         if let Some(id) = chan_info.short_channel_id {
             println!("\t\tshort_channel_id: {},", id);
         }
-        println!("\t\tis_confirmed_onchain: {},", chan_info.is_funding_locked);
+        println!("\t\tis_channel_ready: {},", chan_info.is_channel_ready);
         println!(
             "\t\tchannel_value_satoshis: {},",
             chan_info.channel_value_satoshis
         );
-        println!(
-            "\t\tlocal_balance_msat: {},",
-            chan_info.outbound_capacity_msat
-                + chan_info.unspendable_punishment_reserve.unwrap_or(0) * 1000
-        );
+        println!("\t\tlocal_balance_msat: {},", chan_info.balance_msat);
         if chan_info.is_usable {
             println!(
                 "\t\tavailable_balance_for_send_msat: {},",
@@ -582,12 +700,12 @@ fn open_channel(
     channel_manager: Arc<ChannelManager>,
 ) -> Result<(), ()> {
     let config = UserConfig {
-        peer_channel_config_limits: ChannelHandshakeLimits {
+        channel_handshake_limits: ChannelHandshakeLimits {
             // lnd's max to_self_delay is 2016, so we want to be compatible.
             their_to_self_delay: 2016,
             ..Default::default()
         },
-        channel_options: ChannelConfig {
+        channel_handshake_config: ChannelHandshakeConfig {
             announced_channel,
             ..Default::default()
         },
@@ -606,11 +724,13 @@ fn open_channel(
     }
 }
 
-fn send_payment<E: EventHandler>(
+fn send_payment<E>(
     invoice_payer: &InvoicePayer<E>,
     invoice: &Invoice,
     payment_storage: PaymentInfoStorage,
-) {
+) where
+    E: EventHandler,
+{
     let status = match invoice_payer.pay_invoice(invoice) {
         Ok(_payment_id) => {
             let payee_pubkey = invoice.recover_payee_pub_key();
@@ -653,51 +773,53 @@ fn send_payment<E: EventHandler>(
     );
 }
 
-fn keysend(
+fn keysend<E: EventHandler, K: KeysInterface>(
+    invoice_payer: &InvoicePayer<E>,
     payee_pubkey: PublicKey,
     amt_msat: u64,
-    network_graph: Arc<NetworkGraph>,
-    channel_manager: Arc<ChannelManager>,
+    keys: &K,
     payment_storage: PaymentInfoStorage,
-    logger: Arc<FilesystemLogger>,
-    scorer: Arc<Mutex<Scorer>>,
 ) {
-    let first_hops = channel_manager.list_usable_channels();
-    let payer_pubkey = channel_manager.get_our_node_id();
+    let payment_preimage = keys.get_secure_random_bytes();
 
-    let payee = Payee::for_keysend(payee_pubkey);
-    let params = RouteParameters {
-        payee,
-        final_value_msat: amt_msat,
-        final_cltv_expiry_delta: 40,
-    };
-
-    let route = match router::find_route(
-        &payer_pubkey,
-        &params,
-        &network_graph,
-        Some(&first_hops.iter().collect::<Vec<_>>()),
-        logger,
-        &scorer.lock().unwrap(),
+    let status = match invoice_payer.pay_pubkey(
+        payee_pubkey,
+        PaymentPreimage(payment_preimage),
+        amt_msat,
+        40,
     ) {
-        Ok(r) => r,
-        Err(e) => {
-            println!("ERROR: failed to find route: {}", e.err);
+        Ok(_payment_id) => {
+            println!(
+                "EVENT: initiated sending {} msats to {}",
+                amt_msat, payee_pubkey
+            );
+            print!("> ");
+            HTLCStatus::Pending
+        }
+        Err(PaymentError::Invoice(e)) => {
+            println!("ERROR: invalid payee: {}", e);
+            print!("> ");
             return;
+        }
+        Err(PaymentError::Routing(e)) => {
+            println!("ERROR: failed to find route: {}", e.err);
+            print!("> ");
+            return;
+        }
+        Err(PaymentError::Sending(e)) => {
+            println!("ERROR: failed to send payment: {:?}", e);
+            print!("> ");
+            HTLCStatus::Failed
         }
     };
 
     let mut payments = payment_storage.lock().unwrap();
-    let payment_hash = channel_manager
-        .send_spontaneous_payment(&route, None)
-        .unwrap()
-        .0;
     payments.insert(
-        payment_hash,
+        PaymentHash(Sha256::hash(&payment_preimage).into_inner()),
         PaymentInfo {
             preimage: None,
             secret: None,
-            status: HTLCStatus::Pending,
+            status,
             amt_msat: MillisatAmount(Some(amt_msat)),
         },
     );
@@ -709,6 +831,8 @@ fn get_invoice(
     channel_manager: Arc<ChannelManager>,
     keys_manager: Arc<KeysManager>,
     network: Network,
+    expiry_secs: u32,
+    logger: Arc<disk::FilesystemLogger>,
 ) {
     let mut payments = payment_storage.lock().unwrap();
     let currency = match network {
@@ -720,9 +844,11 @@ fn get_invoice(
     let invoice = match utils::create_invoice_from_channelmanager(
         &channel_manager,
         keys_manager,
+        logger,
         currency,
         Some(amt_msat),
         "ldk-tutorial-node".to_string(),
+        expiry_secs,
     ) {
         Ok(inv) => {
             println!("SUCCESS: generated invoice: {}", inv);
@@ -746,15 +872,23 @@ fn get_invoice(
     );
 }
 
-fn close_channel(channel_id: [u8; 32], channel_manager: Arc<ChannelManager>) {
-    match channel_manager.close_channel(&channel_id) {
+fn close_channel(
+    channel_id: [u8; 32],
+    counterparty_node_id: PublicKey,
+    channel_manager: Arc<ChannelManager>,
+) {
+    match channel_manager.close_channel(&channel_id, &counterparty_node_id) {
         Ok(()) => println!("EVENT: initiating channel close"),
         Err(e) => println!("ERROR: failed to close channel: {:?}", e),
     }
 }
 
-fn force_close_channel(channel_id: [u8; 32], channel_manager: Arc<ChannelManager>) {
-    match channel_manager.force_close_channel(&channel_id) {
+fn force_close_channel(
+    channel_id: [u8; 32],
+    counterparty_node_id: PublicKey,
+    channel_manager: Arc<ChannelManager>,
+) {
+    match channel_manager.force_close_broadcasting_latest_txn(&channel_id, &counterparty_node_id) {
         Ok(()) => println!("EVENT: initiating channel force-close"),
         Err(e) => println!("ERROR: failed to force-close channel: {:?}", e),
     }
@@ -793,4 +927,27 @@ pub(crate) fn parse_peer_info(
     }
 
     Ok((pubkey.unwrap(), peer_addr.unwrap().unwrap()))
+}
+
+struct UserOnionMessageContents {
+    tlv_type: u64,
+    data: Vec<u8>,
+}
+
+impl CustomOnionMessageContents for UserOnionMessageContents {
+    fn tlv_type(&self) -> u64 {
+        self.tlv_type
+    }
+}
+impl MaybeReadableArgs<u64> for UserOnionMessageContents {
+    fn read<R: std::io::Read>(_r: &mut R, _args: u64) -> Result<Option<Self>, DecodeError> {
+        // UserOnionMessageContents is only ever passed to `send_onion_message`, never to an
+        // `OnionMessageHandler`, thus it does not need to implement the read side here.
+        unreachable!();
+    }
+}
+impl Writeable for UserOnionMessageContents {
+    fn write<W: Writer>(&self, w: &mut W) -> Result<(), std::io::Error> {
+        w.write_all(&self.data)
+    }
 }

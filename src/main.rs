@@ -15,11 +15,11 @@ use bitcoin::secp256k1::Secp256k1;
 use bitcoin::util::bip32::{ChildNumber, DerivationPath, ExtendedPrivKey};
 use bitcoin::BlockHash;
 use bitcoin_bech32::WitnessProgram;
-use lightning::chain;
 use lightning::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget, FeeEstimator};
-use lightning::chain::chainmonitor;
 use lightning::chain::channelmonitor::ChannelMonitor;
-use lightning::chain::keysinterface::{InMemorySigner, KeysInterface, KeysManager};
+use lightning::chain::keysinterface::{InMemorySigner, KeysInterface, KeysManager, Recipient};
+use lightning::chain::{self};
+use lightning::chain::{chainmonitor, ChannelMonitorUpdateStatus};
 use lightning::chain::{BestBlock, Filter, Watch};
 use lightning::ln::channelmanager;
 use lightning::ln::channelmanager::{
@@ -27,13 +27,14 @@ use lightning::ln::channelmanager::{
 };
 use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, SimpleArcPeerManager};
 use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
-use lightning::routing::network_graph::{NetGraphMsgHandler, NetworkGraph};
-use lightning::routing::scoring::Scorer;
+use lightning::onion_message::SimpleArcOnionMessenger;
+use lightning::routing::gossip::{NetworkGraph, NodeId, P2PGossipSync};
+use lightning::routing::scoring::ProbabilisticScorer;
 use lightning::util::config::UserConfig;
 use lightning::util::events::{Event, PaymentPurpose};
 use lightning::util::ser::ReadableArgs;
-use lightning_background_processor::BackgroundProcessor;
-use lightning_invoice::payment;
+use lightning_background_processor::{BackgroundProcessor, GossipSync};
+use lightning_invoice::payment::{self};
 use lightning_invoice::utils::DefaultRouter;
 use lightning_net_tokio::SocketDescriptor;
 use lightning_persister::FilesystemPersister;
@@ -99,15 +100,14 @@ pub(crate) type PeerManager = SimpleArcPeerManager<
 pub(crate) type ChannelManager =
     SimpleArcChannelManager<ChainMonitor, LightningWallet, LightningWallet, FilesystemLogger>;
 
-pub(crate) type InvoicePayer<E> = payment::InvoicePayer<
-    Arc<ChannelManager>,
-    Router,
-    Arc<Mutex<Scorer>>,
-    Arc<FilesystemLogger>,
-    E,
->;
+pub(crate) type InvoicePayer<E> =
+    payment::InvoicePayer<Arc<ChannelManager>, Router, Arc<FilesystemLogger>, E>;
 
-type Router = DefaultRouter<Arc<NetworkGraph>, Arc<FilesystemLogger>>;
+type Router = DefaultRouter<Arc<NetGraph>, Arc<FilesystemLogger>, Arc<Mutex<Scorer>>>;
+type Scorer = ProbabilisticScorer<Arc<NetGraph>, Arc<FilesystemLogger>>;
+type NetGraph = NetworkGraph<Arc<FilesystemLogger>>;
+
+type OnionMessenger = SimpleArcOnionMessenger<FilesystemLogger>;
 
 type ConfirmableMonitor = (
     ChannelMonitor<InMemorySigner>,
@@ -129,7 +129,7 @@ fn get_wpkh_descriptors_for_extended_key(
     };
 
     let base_path = DerivationPath::from_str(base_path).unwrap();
-    let derivation_path = base_path.extend(&[
+    let derivation_path = base_path.extend([
         ChildNumber::from_hardened_idx(coin_type).unwrap(),
         ChildNumber::from_hardened_idx(account_number).unwrap(),
     ]);
@@ -151,6 +151,7 @@ fn get_wpkh_descriptors_for_extended_key(
 async fn handle_ldk_events(
     channel_manager: Arc<ChannelManager>,
     wallet: Arc<LightningWallet>,
+    network_graph: &NetGraph,
     keys_manager: Arc<KeysManager>,
     inbound_payments: PaymentInfoStorage,
     outbound_payments: PaymentInfoStorage,
@@ -162,6 +163,7 @@ async fn handle_ldk_events(
             temporary_channel_id,
             channel_value_satoshis,
             output_script,
+            counterparty_node_id,
             ..
         } => {
             // Construct the raw transaction with one output, that is paid the amount of the
@@ -192,7 +194,11 @@ async fn handle_ldk_events(
 
             // Give the funding transaction back to LDK for opening the channel.
             if channel_manager
-                .funding_transaction_generated(temporary_channel_id, funding_tx)
+                .funding_transaction_generated(
+                    temporary_channel_id,
+                    counterparty_node_id,
+                    funding_tx,
+                )
                 .is_err()
             {
                 println!(
@@ -204,47 +210,23 @@ async fn handle_ldk_events(
         Event::PaymentReceived {
             payment_hash,
             purpose,
-            amt,
+            amount_msat,
             ..
         } => {
-            let mut payments = inbound_payments.lock().unwrap();
-            let (payment_preimage, payment_secret) = match purpose {
+            println!(
+                "\nEVENT: received payment from payment hash {} of {} millisatoshis",
+                hex_utils::hex_str(&payment_hash.0),
+                amount_msat,
+            );
+            print!("> ");
+            io::stdout().flush().unwrap();
+            let payment_preimage = match purpose {
                 PaymentPurpose::InvoicePayment {
-                    payment_preimage,
-                    payment_secret,
-                    ..
-                } => (*payment_preimage, Some(*payment_secret)),
-                PaymentPurpose::SpontaneousPayment(preimage) => (Some(*preimage), None),
+                    payment_preimage, ..
+                } => *payment_preimage,
+                PaymentPurpose::SpontaneousPayment(preimage) => Some(*preimage),
             };
-            let status = match channel_manager.claim_funds(payment_preimage.unwrap()) {
-                true => {
-                    println!(
-                        "\nEVENT: received payment from payment hash {} of {} millisatoshis",
-                        hex_utils::hex_str(&payment_hash.0),
-                        amt
-                    );
-                    print!("> ");
-                    io::stdout().flush().unwrap();
-                    HTLCStatus::Succeeded
-                }
-                _ => HTLCStatus::Failed,
-            };
-            match payments.entry(*payment_hash) {
-                Entry::Occupied(mut e) => {
-                    let payment = e.get_mut();
-                    payment.status = status;
-                    payment.preimage = payment_preimage;
-                    payment.secret = payment_secret;
-                }
-                Entry::Vacant(e) => {
-                    e.insert(PaymentInfo {
-                        preimage: payment_preimage,
-                        secret: payment_secret,
-                        status,
-                        amt_msat: MillisatAmount(Some(*amt)),
-                    });
-                }
-            }
+            channel_manager.claim_funds(payment_preimage.unwrap());
         }
         Event::PaymentSent {
             payment_preimage,
@@ -270,7 +252,7 @@ async fn handle_ldk_events(
         }
         Event::PaymentPathFailed {
             payment_hash,
-            rejected_by_dest,
+            payment_failed_permanently,
             all_paths_failed,
             short_channel_id,
             ..
@@ -287,7 +269,7 @@ async fn handle_ldk_events(
             if let Some(scid) = short_channel_id {
                 print!(" because of failure at channel {}", scid);
             }
-            if *rejected_by_dest {
+            if *payment_failed_permanently {
                 println!(": re-attempting the payment will not succeed");
             } else {
                 println!(": exhausted payment retry attempts");
@@ -304,7 +286,46 @@ async fn handle_ldk_events(
         Event::PaymentForwarded {
             fee_earned_msat,
             claim_from_onchain_tx,
+            prev_channel_id,
+            next_channel_id,
         } => {
+            let read_only_network_graph = network_graph.read_only();
+            let nodes = read_only_network_graph.nodes();
+            let channels = channel_manager.list_channels();
+
+            let node_str = |channel_id: &Option<[u8; 32]>| match channel_id {
+                None => String::new(),
+                Some(channel_id) => match channels.iter().find(|c| c.channel_id == *channel_id) {
+                    None => String::new(),
+                    Some(channel) => {
+                        match nodes.get(&NodeId::from_pubkey(&channel.counterparty.node_id)) {
+                            None => "private node".to_string(),
+                            Some(node) => match &node.announcement_info {
+                                None => "unnamed node".to_string(),
+                                Some(announcement) => {
+                                    format!("node {}", announcement.alias)
+                                }
+                            },
+                        }
+                    }
+                },
+            };
+            let channel_str = |channel_id: &Option<[u8; 32]>| {
+                channel_id
+                    .map(|channel_id| format!(" with channel {}", hex_utils::hex_str(&channel_id)))
+                    .unwrap_or_default()
+            };
+            let from_prev_str = format!(
+                " from {}{}",
+                node_str(prev_channel_id),
+                channel_str(prev_channel_id)
+            );
+            let to_next_str = format!(
+                " to {}{}",
+                node_str(next_channel_id),
+                channel_str(next_channel_id)
+            );
+
             let from_onchain_str = if *claim_from_onchain_tx {
                 "from onchain downstream claim"
             } else {
@@ -312,13 +333,13 @@ async fn handle_ldk_events(
             };
             if let Some(fee_earned) = fee_earned_msat {
                 println!(
-                    "\nEVENT: Forwarded payment, earning {} msat {}",
-                    fee_earned, from_onchain_str
+                    "\nEVENT: Forwarded payment{}{}, earning {} msat {}",
+                    from_prev_str, to_next_str, fee_earned, from_onchain_str
                 );
             } else {
                 println!(
-                    "\nEVENT: Forwarded payment, claiming onchain {}",
-                    from_onchain_str
+                    "\nEVENT: Forwarded payment{}{}, claiming onchain {}",
+                    from_prev_str, to_next_str, from_onchain_str
                 );
             }
             print!("> ");
@@ -378,6 +399,50 @@ async fn handle_ldk_events(
         } => {
             eprintln!("Event::PaymentPathSuccessful is not yet implemented");
         }
+        Event::PaymentClaimed {
+            payment_hash,
+            purpose,
+            amount_msat,
+        } => {
+            println!(
+                "\nEVENT: claimed payment from payment hash {} of {} millisatoshis",
+                hex_utils::hex_str(&payment_hash.0),
+                amount_msat,
+            );
+            print!("> ");
+            io::stdout().flush().unwrap();
+            let (payment_preimage, payment_secret) = match purpose {
+                PaymentPurpose::InvoicePayment {
+                    payment_preimage,
+                    payment_secret,
+                    ..
+                } => (*payment_preimage, Some(*payment_secret)),
+                PaymentPurpose::SpontaneousPayment(preimage) => (Some(*preimage), None),
+            };
+            let mut payments = inbound_payments.lock().unwrap();
+            match payments.entry(*payment_hash) {
+                Entry::Occupied(mut e) => {
+                    let payment = e.get_mut();
+                    payment.status = HTLCStatus::Succeeded;
+                    payment.preimage = payment_preimage;
+                    payment.secret = payment_secret;
+                }
+                Entry::Vacant(e) => {
+                    e.insert(PaymentInfo {
+                        preimage: payment_preimage,
+                        secret: payment_secret,
+                        status: HTLCStatus::Succeeded,
+                        amt_msat: MillisatAmount(Some(*amount_msat)),
+                    });
+                }
+            }
+        }
+        Event::ProbeSuccessful { .. } => {}
+        Event::ProbeFailed { .. } => {}
+        Event::OpenChannelRequest { .. } => {
+            // Unreachable, we don't set manually_accept_inbound_channels
+        }
+        Event::HTLCHandlingFailed { .. } => {}
     }
 }
 
@@ -448,13 +513,12 @@ async fn start_ldk() {
         Some(change_descriptor_template),
         args.network,
         database,
-        blockchain,
     )
     .unwrap();
 
     // Initialize our 'lightning wallet' which will implement some ldk functionality
     // on top of our bdk wallet
-    let lightning_wallet = Arc::new(LightningWallet::new(bdk_wallet));
+    let lightning_wallet = Arc::new(LightningWallet::new(Box::new(blockchain), bdk_wallet));
 
     // ## Setup
     // Step 1: Initialize the FeeEstimator
@@ -473,6 +537,8 @@ async fn start_ldk() {
     // Step 4: Initialize Persist
     let persister = Arc::new(FilesystemPersister::new(ldk_data_dir.clone()));
 
+    // TODO: Maybe we don't really need to have the transaction filter (this one
+    // was removed in ldk-example)
     // Step 5: Initialize the Transaction Filter
 
     // LightningWallet implements the Filter trait for us
@@ -495,10 +561,16 @@ async fn start_ldk() {
         .read_channelmonitors(keys_manager.clone())
         .unwrap();
 
+    // TODO: This is new, check whether this is needed
+    // Step 9: Poll for the best chain tip, which may be used by the channel manager & spv client
+    // let polled_chain_tip = init::validate_best_block_header(lightning_wallet.as_ref())
+    //     .await
+    //     .expect("Failed to fetch best block header and best block");
+
     // Step 9: Initialize the ChannelManager
     let mut user_config = UserConfig::default();
     user_config
-        .peer_channel_config_limits
+        .channel_handshake_limits
         .force_announced_channel_preference = false;
 
     let (_channel_manager_blockhash, channel_manager) = {
@@ -577,9 +649,10 @@ async fn start_ldk() {
     for confirmable_monitor in confirmable_monitors.drain(..) {
         let channel_monitor = confirmable_monitor.0;
         let funding_txo = channel_monitor.get_funding_txo().0;
-        chain_monitor
-            .watch_channel(funding_txo, channel_monitor)
-            .unwrap();
+        assert_eq!(
+            chain_monitor.watch_channel(funding_txo, channel_monitor),
+            ChannelMonitorUpdateStatus::Completed
+        );
     }
 
     // this probably doesn't need to be done here
@@ -591,45 +664,44 @@ async fn start_ldk() {
 
     lightning_wallet.sync(confirmables).unwrap();
 
-    // Step 12: Optional: Initialize the NetGraphMsgHandler
+    // Step 11: Optional: Initialize the P2PGossipSync
     let genesis = genesis_block(args.network).header.block_hash();
     let network_graph_path = format!("{}/network_graph", ldk_data_dir.clone());
-    let network_graph = Arc::new(disk::read_network(Path::new(&network_graph_path), genesis));
-    let network_gossip = Arc::new(NetGraphMsgHandler::new(
+    let network_graph = Arc::new(disk::read_network(
+        Path::new(&network_graph_path),
+        genesis,
+        logger.clone(),
+    ));
+    let gossip_sync = Arc::new(P2PGossipSync::new(
         Arc::clone(&network_graph),
         None::<Arc<dyn chain::Access + Send + Sync>>,
         logger.clone(),
     ));
-    let network_graph_persist = Arc::clone(&network_graph);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(600));
-        loop {
-            interval.tick().await;
-            if disk::persist_network(Path::new(&network_graph_path), &network_graph_persist)
-                .is_err()
-            {
-                // Persistence errors here are non-fatal as we can just fetch the routing graph
-                // again later, but they may indicate a disk error which could be fatal elsewhere.
-                eprintln!(
-                    "Warning: Failed to persist network graph, check your disk and permissions"
-                );
-            }
-        }
-    });
 
     // Step 13: Initialize the PeerManager
+    let onion_messenger: Arc<OnionMessenger> = Arc::new(OnionMessenger::new(
+        keys_manager.clone(),
+        logger.clone(),
+        IgnoringMessageHandler {},
+    ));
     let mut ephemeral_bytes = [0; 32];
+    let current_time = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     rand::thread_rng().fill_bytes(&mut ephemeral_bytes);
     let lightning_msg_handler = MessageHandler {
         chan_handler: channel_manager.clone(),
-        route_handler: network_gossip.clone(),
+        route_handler: gossip_sync.clone(),
+        onion_message_handler: onion_messenger.clone(),
     };
-    let peer_manager = Arc::new(PeerManager::new(
+    let peer_manager: Arc<PeerManager> = Arc::new(PeerManager::new(
         lightning_msg_handler,
-        keys_manager.get_node_secret(),
+        keys_manager.get_node_secret(Recipient::Node).unwrap(),
+        current_time as u32,
         &ephemeral_bytes,
         logger.clone(),
-        Arc::new(IgnoringMessageHandler {}),
+        IgnoringMessageHandler {},
     ));
 
     // ## Running LDK
@@ -684,10 +756,12 @@ async fn start_ldk() {
     let outbound_pmts_for_events = outbound_payments.clone();
     let network = args.network;
     let handle = tokio::runtime::Handle::current();
+    let network_graph_events = network_graph.clone();
     let event_handler = move |event: &Event| {
         handle.block_on(handle_ldk_events(
             channel_manager_event_listener.clone(),
             lightning_wallet_listener.clone(),
+            &network_graph_events,
             keys_manager_listener.clone(),
             inbound_pmts_for_events.clone(),
             outbound_pmts_for_events.clone(),
@@ -696,49 +770,42 @@ async fn start_ldk() {
         ));
     };
 
-    // Step 17: Initialize routing Scorer
+    // Step 17: Initialize routing ProbabilisticScorer
     let scorer_path = format!("{}/scorer", ldk_data_dir.clone());
-    let scorer = Arc::new(Mutex::new(disk::read_scorer(Path::new(&scorer_path))));
-    let scorer_persist = Arc::clone(&scorer);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(600));
-        loop {
-            interval.tick().await;
-            if disk::persist_scorer(Path::new(&scorer_path), &scorer_persist.lock().unwrap())
-                .is_err()
-            {
-                // Persistence errors here are non-fatal as channels will be re-scored as payments
-                // fail, but they may indicate a disk error which could be fatal elsewhere.
-                eprintln!("Warning: Failed to persist scorer, check your disk and permissions");
-            }
-        }
-    });
+    let scorer = Arc::new(Mutex::new(disk::read_scorer(
+        Path::new(&scorer_path),
+        Arc::clone(&network_graph),
+        Arc::clone(&logger),
+    )));
 
     // Step 18: Create InvoicePayer
-    let router = DefaultRouter::new(network_graph.clone(), logger.clone());
+    let router = DefaultRouter::new(
+        network_graph.clone(),
+        logger.clone(),
+        keys_manager.get_secure_random_bytes(),
+        scorer.clone(),
+    );
     let invoice_payer = Arc::new(InvoicePayer::new(
         channel_manager.clone(),
         router,
-        scorer.clone(),
         logger.clone(),
         event_handler,
-        payment::RetryAttempts(5),
+        payment::Retry::Timeout(Duration::from_secs(10)),
     ));
 
-    // Step 19: Persist ChannelManager
-    let data_dir = ldk_data_dir.clone();
-    let persist_channel_manager_callback =
-        move |node: &ChannelManager| FilesystemPersister::persist_manager(data_dir.clone(), &*node);
+    // Step 19: Persist ChannelManager and NetworkGraph
+    let persister = Arc::new(FilesystemPersister::new(ldk_data_dir.clone()));
 
     // Step 20: Background Processing
     let background_processor = BackgroundProcessor::start(
-        persist_channel_manager_callback,
+        persister,
         invoice_payer.clone(),
         chain_monitor.clone(),
         channel_manager.clone(),
-        Some(network_gossip.clone()),
+        GossipSync::p2p(gossip_sync.clone()),
         peer_manager.clone(),
         logger.clone(),
+        Some(scorer.clone()),
     );
 
     // Reconnect to channel peers if possible.
@@ -765,14 +832,14 @@ async fn start_ldk() {
     // some public channels, and is only useful if we have public listen address(es) to announce.
     // In a production environment, this should occur only after the announcement of new channels
     // to avoid churn in the global network graph.
-    let chan_manager = Arc::clone(&channel_manager);
+    let peer_man = Arc::clone(&peer_manager);
     let network = args.network;
     if !args.ldk_announced_listen_addr.is_empty() {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                chan_manager.broadcast_node_announcement(
+                peer_man.broadcast_node_announcement(
                     [0; 3],
                     args.ldk_announced_node_name,
                     args.ldk_announced_listen_addr.clone(),
@@ -789,7 +856,7 @@ async fn start_ldk() {
         channel_manager.clone(),
         keys_manager.clone(),
         network_graph.clone(),
-        scorer.clone(),
+        onion_messenger.clone(),
         inbound_payments,
         outbound_payments,
         ldk_data_dir.clone(),

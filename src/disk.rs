@@ -1,17 +1,18 @@
-use crate::cli;
-use bitcoin::secp256k1::key::PublicKey;
+use crate::{cli, NetGraph};
+use bitcoin::secp256k1::PublicKey;
 use bitcoin::BlockHash;
 use chrono::Utc;
-use lightning::routing::network_graph::NetworkGraph;
-use lightning::routing::scoring::Scorer;
+use lightning::routing::gossip::NetworkGraph;
+use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringParameters};
 use lightning::util::logger::{Logger, Record};
-use lightning::util::ser::{Readable, Writeable, Writer};
+use lightning::util::ser::{ReadableArgs, Writer};
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter};
+use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 
 pub(crate) struct FilesystemLogger {
     data_dir: String,
@@ -77,52 +78,30 @@ pub(crate) fn read_channel_peer_data(
     Ok(peer_data)
 }
 
-pub(crate) fn persist_network(path: &Path, network_graph: &NetworkGraph) -> std::io::Result<()> {
-    let mut tmp_path = path.to_path_buf().into_os_string();
-    tmp_path.push(".tmp");
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .open(&tmp_path)?;
-    let write_res = network_graph.write(&mut BufWriter::new(file));
-    if let Err(e) = write_res.and_then(|_| fs::rename(&tmp_path, path)) {
-        let _ = fs::remove_file(&tmp_path);
-        Err(e)
-    } else {
-        Ok(())
-    }
-}
-
-pub(crate) fn read_network(path: &Path, genesis_hash: BlockHash) -> NetworkGraph {
+pub(crate) fn read_network(
+    path: &Path,
+    genesis_hash: BlockHash,
+    logger: Arc<FilesystemLogger>,
+) -> NetGraph {
     if let Ok(file) = File::open(path) {
-        if let Ok(graph) = NetworkGraph::read(&mut BufReader::new(file)) {
+        if let Ok(graph) = NetworkGraph::read(&mut BufReader::new(file), logger.clone()) {
             return graph;
         }
     }
-    NetworkGraph::new(genesis_hash)
+    NetworkGraph::new(genesis_hash, logger)
 }
 
-pub(crate) fn persist_scorer(path: &Path, scorer: &Scorer) -> std::io::Result<()> {
-    let mut tmp_path = path.to_path_buf().into_os_string();
-    tmp_path.push(".tmp");
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .open(&tmp_path)?;
-    let write_res = scorer.write(&mut BufWriter::new(file));
-    if let Err(e) = write_res.and_then(|_| fs::rename(&tmp_path, path)) {
-        let _ = fs::remove_file(&tmp_path);
-        Err(e)
-    } else {
-        Ok(())
-    }
-}
-
-pub(crate) fn read_scorer(path: &Path) -> Scorer {
+pub(crate) fn read_scorer(
+    path: &Path,
+    graph: Arc<NetGraph>,
+    logger: Arc<FilesystemLogger>,
+) -> ProbabilisticScorer<Arc<NetGraph>, Arc<FilesystemLogger>> {
+    let params = ProbabilisticScoringParameters::default();
     if let Ok(file) = File::open(path) {
-        if let Ok(scorer) = Scorer::read(&mut BufReader::new(file)) {
+        let args = (params.clone(), Arc::clone(&graph), Arc::clone(&logger));
+        if let Ok(scorer) = ProbabilisticScorer::read(&mut BufReader::new(file), args) {
             return scorer;
         }
     }
-    Scorer::default()
+    ProbabilisticScorer::new(params, graph, logger)
 }
